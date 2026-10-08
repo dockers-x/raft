@@ -197,6 +197,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ env.SOURCE_REPO }}
             org.opencontainers.image.revision=${{ needs.check-changes.outputs.current_sha }}
             org.opencontainers.image.version=${{ needs.check-changes.outputs.upstream_tag || needs.check-changes.outputs.short_sha }}
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
 
       - name: Build and push ${{ matrix.image }}
         uses: docker/build-push-action@v6
