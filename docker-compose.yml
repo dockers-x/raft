@@ -1,0 +1,179 @@
+# Community self-hosting example for the Raft platform images built in this
+# repository. This is a starting point, not an officially supported deployment:
+# upstream (botiverse/raft-source) publishes production Dockerfiles, not a
+# compose stack, and its own deployment scripts are private.
+#
+# Topology:
+#   browser -> caddy :8080 -> web (static nginx)
+#                          -> /api,/socket.io,/daemon -> server :3001
+#   server  -> postgres, redis, rustfs (S3-compatible object storage)
+#
+# First run:
+#   cp .env.example .env    # set JWT_SECRET and POSTGRES_PASSWORD at minimum
+#   docker compose up -d
+#   open http://localhost:8080
+#
+# The one-shot `migrate` service applies the database schema and the one-shot
+# `rustfs-bucket-init` service creates the attachment buckets before `server`
+# starts.
+
+name: raft
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-raft}
+      POSTGRES_USER: ${POSTGRES_USER:-raft}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - raft-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raft} -d ${POSTGRES_DB:-raft}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Uncomment to reach Postgres from the host:
+    # ports:
+    #   - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - raft-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # S3-compatible object storage (same component the upstream dev stack uses).
+  # Replace with MinIO / Cloudflare R2 / AWS S3 by changing the S3_* values.
+  rustfs:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:-raftminio}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:-raftminio-change-me}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - raft-rustfs-data:/data
+    depends_on:
+      rustfs-data-init:
+        condition: service_completed_successfully
+    # Uncomment to reach the S3 API (9000) / console (9001) from the host:
+    # ports:
+    #   - "9000:9000"
+    #   - "9001:9001"
+
+  # rustfs runs as uid 10001; make sure the fresh volume is writable.
+  rustfs-data-init:
+    image: alpine:3.20
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /data"]
+    volumes:
+      - raft-rustfs-data:/data
+
+  # One-shot bucket bootstrap: an S3 store starts empty and the server needs
+  # its buckets to exist. Uses MinIO's mc client against the S3 endpoint.
+  rustfs-bucket-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_started
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-raftminio}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-raftminio-change-me}
+      S3_ATTACHMENTS_BUCKET: ${S3_ATTACHMENTS_BUCKET:-raft-attachments}
+      S3_CDN_BUCKET: ${S3_CDN_BUCKET:-raft-attachments}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until mc alias set raft http://rustfs:9000 "$$S3_ACCESS_KEY_ID" "$$S3_SECRET_ACCESS_KEY" >/dev/null 2>&1; do
+          echo "waiting for rustfs..."
+          sleep 2
+        done
+        mc mb --ignore-existing "raft/$$S3_ATTACHMENTS_BUCKET"
+        mc mb --ignore-existing "raft/$$S3_CDN_BUCKET"
+    restart: "no"
+
+  # One-shot schema migration. Postgres deployments do not auto-migrate on
+  # server boot; this runs the upstream deploy migration chain
+  # (migration-preflight -> migrate-deploy -> privilege verification).
+  migrate:
+    image: ${RAFT_SERVER_IMAGE:-czyt/raft-server:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-raft}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-raft}
+    command: ["pnpm", "--filter", "@botiverse/raft-server", "db:migrate:deploy"]
+    restart: "no"
+
+  server:
+    image: ${RAFT_SERVER_IMAGE:-czyt/raft-server:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      rustfs-bucket-init:
+        condition: service_completed_successfully
+    environment:
+      # ── required ──
+      DATABASE_URL: postgresql://${POSTGRES_USER:-raft}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-raft}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      # ── core ──
+      PORT: "3001"
+      NODE_ENV: production
+      # Public URL that daemons/computers use to connect back to this server.
+      SERVER_URL: ${SERVER_URL:-http://localhost:3001}
+      # Canonical user-facing web app origin (the caddy entrypoint below).
+      APP_URL: ${APP_URL:-http://localhost:8080}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      # ── redis (multi-replica / realtime scaling; harmless single-node) ──
+      REDIS_URL: redis://redis:6379
+      # ── object storage ──
+      S3_ENDPOINT: http://rustfs:9000
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "true"
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-raftminio}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-raftminio-change-me}
+      S3_ATTACHMENTS_BUCKET: ${S3_ATTACHMENTS_BUCKET:-raft-attachments}
+      S3_CDN_BUCKET: ${S3_CDN_BUCKET:-raft-attachments}
+    ports:
+      # Exposed on the host so daemons on this machine can use
+      # SERVER_URL=http://localhost:3001 directly.
+      - "${SERVER_PORT:-3001}:3001"
+
+  web:
+    image: ${RAFT_WEB_IMAGE:-czyt/raft-web:latest}
+    restart: unless-stopped
+    # The bundled web image serves the SPA and expects same-origin /api,
+    # /socket.io and /daemon routes — see the caddy service below.
+    # Uncomment to reach nginx directly:
+    # ports:
+    #   - "8081:80"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - server
+      - web
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  raft-postgres-data:
+  raft-redis-data:
+  raft-rustfs-data:

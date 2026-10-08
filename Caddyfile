@@ -1,0 +1,22 @@
+# Raft self-hosting front door: serves the web client and proxies API,
+# realtime and daemon traffic to the server container. The prebuilt web image
+# uses same-origin relative paths (/api, /socket.io, /daemon), which is why
+# this proxy exists.
+
+:80 {
+	handle /api/* {
+		reverse_proxy server:3001
+	}
+
+	handle /socket.io/* {
+		reverse_proxy server:3001
+	}
+
+	handle /daemon/* {
+		reverse_proxy server:3001
+	}
+
+	handle {
+		reverse_proxy web:80
+	}
+}
