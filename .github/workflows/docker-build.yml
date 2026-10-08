@@ -11,7 +11,9 @@ name: Build and Push Docker Images
 #   raft-web           <- packages/web/Dockerfile
 #   raft-trace-upload  <- packages/trace-upload-worker/Dockerfile
 #
-# to Docker Hub and GHCR as linux/amd64 + linux/arm64.
+# to Docker Hub and GHCR as linux/amd64 + linux/arm64. Images also carry the
+# upstream release version as a tag (e.g. v1.21.2 and v1.21.2-source.1), since
+# the release mirror tags each release commit.
 
 on:
   schedule:
@@ -54,13 +56,18 @@ jobs:
       short_sha: ${{ steps.check.outputs.short_sha }}
       build_date: ${{ steps.check.outputs.build_date }}
       build_at: ${{ steps.check.outputs.build_at }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
     steps:
       - name: Checkout source repository (${{ env.SOURCE_REPO }})
         uses: actions/checkout@v6
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_BRANCH }}
-          fetch-depth: 1
+          # Full history + tags so `git describe --tags` can resolve the
+          # release tag for this commit (the release mirror is tiny).
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Check for changes
         id: check
@@ -72,10 +79,22 @@ jobs:
           BUILD_DATE=$(date -u +'%Y%m%d')
           BUILD_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
+          # The release mirror tags every release commit (vX.Y.Z-source.N).
+          # Carry the real application version through to image tags/labels;
+          # falls back to nothing when a commit has no exact tag.
+          UPSTREAM_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+          UPSTREAM_VERSION=""
+          if [ -n "$UPSTREAM_TAG" ]; then
+            UPSTREAM_VERSION=$(printf '%s' "$UPSTREAM_TAG" | sed -E 's/-source\.[0-9]+$//')
+          fi
+
           echo "current_sha=${CURRENT_SHA}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
           echo "build_at=${BUILD_AT}" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Upstream release: ${UPSTREAM_TAG:-none} (version ${UPSTREAM_VERSION:-none})"
 
           if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -169,12 +188,15 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ needs.check-changes.outputs.build_date }}
             type=raw,value=sha-${{ needs.check-changes.outputs.short_sha }}
+            type=raw,value=${{ needs.check-changes.outputs.upstream_version }},enable=${{ needs.check-changes.outputs.upstream_version != '' }}
+            type=raw,value=${{ needs.check-changes.outputs.upstream_tag }},enable=${{ needs.check-changes.outputs.upstream_tag != '' }}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.description=${{ matrix.description }} — community build of botiverse/raft-source
             org.opencontainers.image.url=https://raft.build
             org.opencontainers.image.source=https://github.com/${{ env.SOURCE_REPO }}
             org.opencontainers.image.revision=${{ needs.check-changes.outputs.current_sha }}
+            org.opencontainers.image.version=${{ needs.check-changes.outputs.upstream_tag || needs.check-changes.outputs.short_sha }}
 
       - name: Build and push ${{ matrix.image }}
         uses: docker/build-push-action@v6
@@ -200,6 +222,7 @@ jobs:
             VITE_COMMIT_SHA=${{ needs.check-changes.outputs.current_sha }}
             VITE_BUILD_AT=${{ needs.check-changes.outputs.build_at }}
             VITE_RELEASE_BRANCH=${{ env.SOURCE_BRANCH }}
+            VITE_FRONTEND_RELEASE_ID=${{ needs.check-changes.outputs.upstream_tag }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
@@ -207,6 +230,8 @@ jobs:
         run: |
           {
             echo "## Docker image built: \`${{ matrix.image }}\`"
+            echo ""
+            echo "**Upstream release:** \`${{ needs.check-changes.outputs.upstream_tag || 'unknown' }}\`"
             echo ""
             echo "**Source commit:** \`${{ needs.check-changes.outputs.short_sha }}\`"
             echo ""
@@ -234,6 +259,8 @@ jobs:
             echo "## Build skipped"
             echo ""
             echo "No new upstream commits detected since the last build."
+            echo ""
+            echo "**Current release:** \`${{ needs.check-changes.outputs.upstream_tag || 'unknown' }}\`"
             echo ""
             echo "**Current commit:** \`${{ needs.check-changes.outputs.short_sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

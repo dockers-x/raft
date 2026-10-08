@@ -17,16 +17,23 @@ Docker Hub 和 GHCR。
 | `raft-web` | `packages/web/Dockerfile` | Web 前端（Vite 静态构建，nginx 托管，端口 80） |
 | `raft-trace-upload` | `packages/trace-upload-worker/Dockerfile` | trace 上传 worker（端口 3000） |
 
-支持 `linux/amd64` 与 `linux/arm64`。每个镜像提供三种标签：
+支持 `linux/amd64` 与 `linux/arm64`。镜像标签：
 
 | 标签 | 说明 |
 | --- | --- |
 | `latest` | 最新一次成功构建 |
+| `v1.21.2` | 上游应用版本（release 版号） |
+| `v1.21.2-source.1` | 上游完整 release 标签（含源码快照序号） |
 | `YYYYMMDD` | 按构建日期 |
 | `sha-xxxxxxx` | 按上游源码 commit |
 
+版本标签直接对应上游 release：`raft-source` 每发布一个版本就导出一个快照
+commit 并打上 `vX.Y.Z-source.N` 标签，镜像标签与之逐字对应。上游 commit
+没有精确 tag 时，只保留 `latest` / 日期 / `sha-` 标签。
+
 ```bash
 # Docker Hub
+docker pull czyt/raft-server:v1.21.2
 docker pull czyt/raft-server:latest
 docker pull czyt/raft-web:latest
 docker pull czyt/raft-trace-upload:latest
